@@ -17,8 +17,10 @@ import "core:math/linalg"
 
 
 NUM_RENDERTARGETS :: 2
-SHADER_FILENAME :: "main.hlsl"
+SHADER_FILENAME :: "shaders/main.hlsl"
 NUM_DESCRIPTORS :: 128
+WINDOW_WIDTH :: 800
+WINDOW_HEIGHT :: 600
 
 Vertex :: struct {
     position : linalg.Vector3f32,
@@ -52,8 +54,8 @@ mat4_identity :: proc() -> linalg.Matrix4x4f32 {
 
 main :: proc() {
 
-    wx := i32(800)
-    wy := i32(600)
+    wx := i32(WINDOW_WIDTH)
+    wy := i32(WINDOW_HEIGHT)
 
     ok := sdl3.Init(sdl3.INIT_VIDEO)
     if (!ok) {
@@ -62,7 +64,7 @@ main :: proc() {
     }
     defer sdl3.Quit()
     
-    window := sdl3.CreateWindow("game", wx, wy, nil)
+    window := sdl3.CreateWindow("Renderer!", wx, wy, nil)
     if (window == nil) {
         fmt.println("Failed to create window!")
         return
