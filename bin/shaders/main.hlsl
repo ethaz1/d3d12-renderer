@@ -22,7 +22,7 @@ PSInput VSMain(float4 position : POSITION0, float4 color : COLOR0) {
    //float4 projPos = mul(viewPos, proj);     
 
    result.position = projPos;
-   result.color = color;
+   result.color = (color + 1.0) / 2.0;
    return result;
 }
 

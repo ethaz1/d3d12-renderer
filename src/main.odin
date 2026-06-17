@@ -3,6 +3,7 @@
 
 package main
 
+import "core:strconv"
 import win32 "core:sys/windows"
 import "core:os"
 import "core:fmt"
@@ -19,8 +20,9 @@ import "core:math/linalg"
 NUM_RENDERTARGETS :: 2
 SHADER_FILENAME :: "shaders/main.hlsl"
 NUM_DESCRIPTORS :: 128
-WINDOW_WIDTH :: 800
-WINDOW_HEIGHT :: 600
+WINDOW_WIDTH :: 1280
+WINDOW_HEIGHT :: 720
+MODEL_NAME :: "models/suzanne.obj"
 
 Vertex :: struct {
     position : linalg.Vector3f32,
@@ -53,6 +55,7 @@ mat4_identity :: proc() -> linalg.Matrix4x4f32 {
 }
 
 main :: proc() {
+
 
     wx := i32(WINDOW_WIDTH)
     wy := i32(WINDOW_HEIGHT)
@@ -352,7 +355,7 @@ main :: proc() {
             SampleMask = 0xFFFFFFFF,
             RasterizerState = {
                 FillMode = .SOLID,
-                CullMode = .BACK,
+                CullMode = .FRONT,
                 FrontCounterClockwise = false,
                 DepthBias = 0,
                 DepthBiasClamp = 0,
@@ -399,12 +402,106 @@ main :: proc() {
     // vertex buffer
     vertex_buffer : ^d3d12.IResource
     vertex_buffer_view : d3d12.VERTEX_BUFFER_VIEW
-    
-    vertices := [?]Vertex {
-        Vertex{ linalg.Vector3f32{0.0, 0.5, 0.0}, linalg.Vector4f32{1.0, 0.0, 0.0, 0.0} },
-        Vertex{ linalg.Vector3f32{0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 1.0, 0.0, 0.0} },
-        Vertex{ linalg.Vector3f32{-0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 0.0, 1.0, 0.0} },
+
+    // model loading
+    positions : [dynamic]linalg.Vector3f32
+    normals : [dynamic]linalg.Vector3f32
+    vertices : [dynamic]Vertex
+    {
+        obj, ok := os.read_entire_file(MODEL_NAME)
+        if !ok {
+            fmt.println("Failed to load model:", MODEL_NAME)
+            os.exit(-1)
+        }
+        defer delete(obj, context.allocator)
+
+        // in the first runthrough, find how many faces we have. count*3 is how big vertices is
+        vertex_count : int
+        it1 := string(obj)
+        for line in strings.split_lines_iterator(&it1) {
+            if strings.starts_with(line, "f") { vertex_count += 3 }
+        }
+        reserve(&vertices, vertex_count)
+
+        // in the second runthrough, parse the OBJ
+        it2 := string(obj)
+        for line in strings.split_lines_iterator(&it2) {
+            if strings.starts_with(line, "v ") {
+                v := strings.fields(line)
+                if len(v) < 4 { continue }
+
+
+                x, ok1 := strconv.parse_f32(v[1])
+                y, ok2 := strconv.parse_f32(v[2])
+                z, ok3 := strconv.parse_f32(v[3])
+
+                if ok1 && ok2 && ok3 {
+                    append(&positions, linalg.Vector3f32{x, y, z})
+                } 
+            }
+            else if strings.starts_with(line, "vn") {
+                vn := strings.fields(line)
+                if len(vn) < 4 { continue }
+
+
+                x, ok1 := strconv.parse_f32(vn[1])
+                y, ok2 := strconv.parse_f32(vn[2])
+                z, ok3 := strconv.parse_f32(vn[3])
+
+                if ok1 && ok2 && ok3 {
+                    append(&normals, linalg.Vector3f32{x, y, z})
+                } 
+            }
+            else if strings.starts_with(line, "f") {
+                // handling vertex index for now (e.g v/vt/vn)
+                // line example : "f 13/13/13 18/18/18 19/19/19"
+                face := strings.fields(line)
+                if len(face) < 4 { continue }
+
+                // the indicies of the vertex data making up this face
+                vertex_indices : [3]int
+                texcoord_indices : [3]int
+                normal_indices : [3]int
+
+                for i := 0; i < 3; i += 1 {    // for each vertex in the face
+                    indices := strings.fields_proc(face[i+1], proc(r: rune) -> bool {return r == '/'})
+                    if len(indices) < 3 { continue }
+                    ok1, ok2, ok3 : bool
+                    vertex_indices[i], _ = strconv.parse_int(indices[0])
+                    texcoord_indices[i], _ = strconv.parse_int(indices[1])
+                    normal_indices[i], _ = strconv.parse_int(indices[2])
+
+                    vertex_indices[i] -= 1
+                    texcoord_indices[i] -= 1
+                    normal_indices[i] -= 1
+                }
+
+                // TODO: index buffers.
+                p1 := positions[vertex_indices[0]]
+                p2 := positions[vertex_indices[1]]
+                p3 := positions[vertex_indices[2]]
+
+                n1 := normals[normal_indices[0]]
+                n2 := normals[normal_indices[1]]
+                n3 := normals[normal_indices[2]]
+
+                append(&vertices, Vertex{ p1, {n1.x, n1.y, n1.z, 1.0} })
+                append(&vertices, Vertex{ p2, {n2.x, n2.y, n2.z, 1.0} })
+                append(&vertices, Vertex{ p3, {n3.x, n3.y, n3.z, 1.0} })
+
+                g: int = 5
+            }
+
+        }
+
     }
+    //strings.fields_proc()
+
+    //vertices := [?]Vertex {
+    //    Vertex{ linalg.Vector3f32{0.0, 0.5, 0.0}, linalg.Vector4f32{1.0, 0.0, 0.0, 0.0} },
+    //    Vertex{ linalg.Vector3f32{0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 1.0, 0.0, 0.0} },
+    //    Vertex{ linalg.Vector3f32{-0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 0.0, 1.0, 0.0} },
+    //}
 
     heap_props := d3d12.HEAP_PROPERTIES {
         Type = .UPLOAD,
@@ -441,7 +538,7 @@ main :: proc() {
 
     vertex_buffer_view = d3d12.VERTEX_BUFFER_VIEW {
         BufferLocation = vertex_buffer->GetGPUVirtualAddress(),
-        StrideInBytes = u32(vertex_buffer_size/3),
+        StrideInBytes = u32(size_of(Vertex)),
         SizeInBytes = u32(vertex_buffer_size)
     }
 
@@ -511,11 +608,14 @@ main :: proc() {
 
     rot : f32 = 0.0
     frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, -2.0})
-    fov_y  : f32 = 60.0 * 3.14159 / 180.0
+    fov_y  : f32 = 70.0 * 3.14159 / 180.0
     aspect := f32(wx) / f32(wy)
     near   : f32 = 0.1
     far    : f32 = 1000.0
-    frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far)
+    frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far, true)
+
+    //frame_constants.proj = linalg.transpose(frame_constants.proj)
+
 
     running := true
     for (running == true) {
@@ -564,11 +664,10 @@ main :: proc() {
         // transformation
         {
             // rotate around our object
-
             using linalg
 
-            frame_constants.world = mat4_identity()
-            frame_constants.view = mul(frame_constants.view, matrix4_rotate_f32(cast(f32)to_radians(0.1), {0.0, 1.0, 0.0}))
+            frame_constants.world = matrix4_scale_f32({0.5, 0.5, 0.5})
+            frame_constants.view = mul(frame_constants.view, matrix4_rotate_f32(cast(f32)to_radians(0.5), {3.0, 3.0, 0.0}))
         }
 
     
@@ -609,7 +708,7 @@ main :: proc() {
         // draw call
         command_list->IASetPrimitiveTopology(.TRIANGLELIST)
         command_list->IASetVertexBuffers(0, 1, &vertex_buffer_view)
-        command_list->DrawInstanced(3, 1, 0, 0)
+        command_list->DrawInstanced((u32)(len(vertices)), 1, 0, 0)
 
         to_present_barrier := to_render_target_barrier
         to_present_barrier.Transition.StateBefore = {.RENDER_TARGET}
