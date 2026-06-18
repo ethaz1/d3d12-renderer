@@ -1,6 +1,7 @@
 // allow using
 #+feature using-stmt 
 
+
 package main
 
 import "core:strconv"
@@ -31,9 +32,9 @@ Vertex :: struct {
 
 // constant buffer (or uniform in OpenGL)
 FrameConstants :: struct {
-    world: linalg.Matrix4x4f32,
-    view: linalg.Matrix4x4f32,
-    proj: linalg.Matrix4x4f32
+    world: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32
 }
 
 // checks the result of an HRESULT
@@ -187,6 +188,65 @@ main :: proc() {
 
         hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&rtv_descriptor_heap))
         check(hr, "Failed creating RTV descriptor heap")
+    }
+
+
+    // depth-stencil view (can store both a depth buffer AND a stencil buffer)
+    dsv_descriptor_heap : ^d3d12.IDescriptorHeap
+    dsv_handle: d3d12.CPU_DESCRIPTOR_HANDLE
+    depth_stencil_buffer : ^d3d12.IResource
+    {
+        desc := d3d12.DESCRIPTOR_HEAP_DESC {
+            NumDescriptors = 1,
+            Type = .DSV,
+            Flags = {}
+        }
+
+        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&dsv_descriptor_heap))
+        check(hr, "Failed creating DSV descriptor heap")
+
+        dsv_desc := d3d12.DEPTH_STENCIL_VIEW_DESC {
+            Format = .D32_FLOAT,
+            ViewDimension = .TEXTURE2D,
+            Texture2D = {MipSlice=0},
+            Flags = {},
+        }
+
+        ds_clear_value := d3d12.CLEAR_VALUE {
+            Format = .D32_FLOAT,
+            DepthStencil = { Depth=1.0, Stencil=0 }
+        }
+        
+        heap_props := d3d12.HEAP_PROPERTIES {
+            Type = .DEFAULT,
+        }
+
+        depth_desc := d3d12.RESOURCE_DESC {
+            Dimension        = .TEXTURE2D,
+            Width            = u64(wx),
+            Height           = u32(wy),
+            DepthOrArraySize = 1,
+            MipLevels        = 1,
+
+            Format = .D32_FLOAT,
+
+            SampleDesc = {
+                Count = 1,
+                Quality = 0
+            },
+
+            Layout = .UNKNOWN,
+
+            Flags = {.ALLOW_DEPTH_STENCIL},
+        }
+
+        hr = device->CreateCommittedResource(&heap_props, {}, &depth_desc, {.DEPTH_WRITE}, &ds_clear_value, d3d12.IResource_UUID, (^rawptr)(&depth_stencil_buffer))
+        check(hr, "Failed to create depth buffer")
+
+        dsv_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&dsv_handle)
+
+        device->CreateDepthStencilView(depth_stencil_buffer, &dsv_desc, dsv_handle)
+        
     }
 
     // constant buffer/shader resource/unordered access view
@@ -355,7 +415,7 @@ main :: proc() {
             SampleMask = 0xFFFFFFFF,
             RasterizerState = {
                 FillMode = .SOLID,
-                CullMode = .FRONT,
+                CullMode = .BACK,
                 FrontCounterClockwise = false,
                 DepthBias = 0,
                 DepthBiasClamp = 0,
@@ -367,8 +427,14 @@ main :: proc() {
                 ConservativeRaster = .OFF,
             },
             DepthStencilState = {
-                DepthEnable = false,
+                DepthEnable = true,
+                DepthWriteMask = .ALL,
+                DepthFunc = .LESS,
                 StencilEnable = false,
+                StencilReadMask = d3d12.DEFAULT_STENCIL_READ_MASK,
+                StencilWriteMask = d3d12.DEFAULT_STENCIL_WRITE_MASK,
+                FrontFace = {d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.COMPARISON_FUNC.ALWAYS},
+                BackFace = {d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.COMPARISON_FUNC.ALWAYS}
             },
             InputLayout = {
                 pInputElementDescs = &vertex_format[0],
@@ -377,7 +443,7 @@ main :: proc() {
             PrimitiveTopologyType = .TRIANGLE,
             NumRenderTargets = 1,
             RTVFormats = { 0 = .R8G8B8A8_UNORM, 1..<7 = .UNKNOWN },
-            DSVFormat = .UNKNOWN,
+            DSVFormat = .D32_FLOAT,
             SampleDesc = {
                 Count = 1,
                 Quality = 0,
@@ -489,19 +555,11 @@ main :: proc() {
                 append(&vertices, Vertex{ p2, {n2.x, n2.y, n2.z, 1.0} })
                 append(&vertices, Vertex{ p3, {n3.x, n3.y, n3.z, 1.0} })
 
-                g: int = 5
             }
 
         }
 
     }
-    //strings.fields_proc()
-
-    //vertices := [?]Vertex {
-    //    Vertex{ linalg.Vector3f32{0.0, 0.5, 0.0}, linalg.Vector4f32{1.0, 0.0, 0.0, 0.0} },
-    //    Vertex{ linalg.Vector3f32{0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 1.0, 0.0, 0.0} },
-    //    Vertex{ linalg.Vector3f32{-0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 0.0, 1.0, 0.0} },
-    //}
 
     heap_props := d3d12.HEAP_PROPERTIES {
         Type = .UPLOAD,
@@ -523,6 +581,7 @@ main :: proc() {
     }
 
     hr = device->CreateCommittedResource(&heap_props, {}, &resource_desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&vertex_buffer))
+
     check(hr, "Failed creating vertex buffer")
 
     gpu_data : rawptr
@@ -605,17 +664,7 @@ main :: proc() {
     }
 
 
-
     rot : f32 = 0.0
-    frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, -2.0})
-    fov_y  : f32 = 70.0 * 3.14159 / 180.0
-    aspect := f32(wx) / f32(wy)
-    near   : f32 = 0.1
-    far    : f32 = 1000.0
-    frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far, true)
-
-    //frame_constants.proj = linalg.transpose(frame_constants.proj)
-
 
     running := true
     for (running == true) {
@@ -663,11 +712,26 @@ main :: proc() {
 
         // transformation
         {
-            // rotate around our object
-            using linalg
+            rot += 0.01
 
-            frame_constants.world = matrix4_scale_f32({0.5, 0.5, 0.5})
-            frame_constants.view = mul(frame_constants.view, matrix4_rotate_f32(cast(f32)to_radians(0.5), {3.0, 3.0, 0.0}))
+            // Object transform
+            model_scale  := linalg.matrix4_scale_f32({1.0, 1.0, 1.0})
+            model_rotate := linalg.matrix4_rotate_f32(rot, {0.0, 1.0, 0.0})
+            frame_constants.world = linalg.mul(model_scale, model_rotate)
+
+            // Camera transform
+            camera_eye    := [3]f32{0.0, 0.0, 5.0}
+            camera_center := [3]f32{0.0, 0.0, 0.0}
+            camera_up     := [3]f32{0.0, 1.0, 0.0}
+            frame_constants.view = linalg.matrix4_look_at_f32(camera_eye, camera_center, camera_up, false)
+
+            // Projection
+            fov_y : f32 = 45.0 * 3.14159 / 180.0
+            aspect := f32(wx) / f32(wy)
+            near   : f32 = 0.1
+            far    : f32 = 1000.0
+            frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far, false)
+
         }
 
     
@@ -696,14 +760,18 @@ main :: proc() {
             rtv_handle.ptr += uint(frame_index * s)
         }
 
+
+        
         // bind root parameter (the shader function arguments)
         command_list->SetGraphicsRootConstantBufferView(0, constant_buffer->GetGPUVirtualAddress())
 
-        command_list->OMSetRenderTargets(1, &rtv_handle, false, nil)
 
-        // clear backbuffer
+        command_list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle)
+
+        // clear backbuffer & depth/stencil 
         clear_colour := [?]f32 { 0.05, 0.05, 0.05, 1.0 }
         command_list->ClearRenderTargetView(rtv_handle, &clear_colour, 0, nil)
+        command_list->ClearDepthStencilView(dsv_handle, {.DEPTH}, 1.0, 0, 0, nil)
 
         // draw call
         command_list->IASetPrimitiveTopology(.TRIANGLELIST)
