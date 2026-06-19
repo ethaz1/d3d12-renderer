@@ -14,12 +14,16 @@ import "vendor:directx/dxgi"
 import "vendor:directx/d3d_compiler"
 import "core:math/linalg"
 
+import "vendor_local/imgui"
+import "vendor_local/imgui/imgui_impl_dx12"
+import "vendor_local/imgui/imgui_impl_sdl3"
+
 
 NUM_RENDERTARGETS :: 2
 SHADER_FILENAME :: "shaders/main.hlsl"
 NUM_DESCRIPTORS :: 128
-WINDOW_WIDTH :: 1280
-WINDOW_HEIGHT :: 720
+WINDOW_WIDTH :: 1920
+WINDOW_HEIGHT :: 1080
 MODEL_NAME :: "models/suzanne.obj"
 
 Vertex :: struct {
@@ -51,6 +55,8 @@ vec4 :: proc(v: linalg.Vector3f32, w: f32) -> linalg.Vector4f32 {
 mat4_identity :: proc() -> linalg.Matrix4x4f32 {
     return linalg.identity_matrix(linalg.Matrix4x4f32)
 }
+
+srv_heap_next_available_index : u32 = 0
 
 main :: proc() {
 
@@ -250,7 +256,7 @@ main :: proc() {
     }
 
     // constant buffer/shader resource/unordered access view
-    cb_descriptor_heap : ^d3d12.IDescriptorHeap
+    srv_heap : ^d3d12.IDescriptorHeap
     {
         desc := d3d12.DESCRIPTOR_HEAP_DESC {
             NumDescriptors = NUM_DESCRIPTORS,   // hope thats enough
@@ -258,7 +264,7 @@ main :: proc() {
             Flags = {.SHADER_VISIBLE}           // data here gets seen by the shaders
         }
 
-        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&cb_descriptor_heap))
+        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&srv_heap))
         check(hr, "Failed creating constant buffer descriptor heap")
     }
 
@@ -687,8 +693,9 @@ main :: proc() {
             SizeInBytes = 256,      // TODO: round up to 256 properly
         }
 
-        cb_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&cbv_handle)
+        srv_heap->GetCPUDescriptorHandleForHeapStart(&cbv_handle)
         device->CreateConstantBufferView(&cbv_desc, cbv_handle)
+        srv_heap_next_available_index += 1 // we need to keep track of our SRVs
     }
 
     // This fence is used to wait for frames to finish
@@ -709,7 +716,56 @@ main :: proc() {
     }
 
 
+    // ImGui
+    imgui.CHECKVERSION()
+    imgui.CreateContext()
+    {
+
+        // initialise D3D12 with ImGui
+        dx12_info := imgui_impl_dx12.InitInfo {
+            Device = device,
+            CommandQueue = queue,
+            NumFramesInFlight = 1, // ??? 
+            RTVFormat = .R8G8B8A8_UNORM,
+            DSVFormat = .D32_FLOAT,
+            UserData = nil,
+            SrvDescriptorHeap = srv_heap,
+            SrvDescriptorAllocFn = proc "cdecl" (info: ^imgui_impl_dx12.InitInfo, cpu_desc_handle: ^d3d12.CPU_DESCRIPTOR_HANDLE, gpu_desc_handle: ^d3d12.GPU_DESCRIPTOR_HANDLE) {
+                // get the next memory offset where we can put another SRV descriptor
+                cpu_base : d3d12.CPU_DESCRIPTOR_HANDLE
+                gpu_base : d3d12.GPU_DESCRIPTOR_HANDLE
+
+                info.SrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(&cpu_base)
+                info.SrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(&gpu_base)
+
+                descriptor_size := info.Device->GetDescriptorHandleIncrementSize(.CBV_SRV_UAV)
+                offset := srv_heap_next_available_index * descriptor_size
+
+                cpu_desc_handle.ptr = cpu_base.ptr + (uint)(offset)
+                gpu_desc_handle.ptr = gpu_base.ptr + (u64)(offset)
+
+                srv_heap_next_available_index += 1
+            },
+            SrvDescriptorFreeFn = proc "cdecl" (info: ^imgui_impl_dx12.InitInfo, cpu_desc_handle: d3d12.CPU_DESCRIPTOR_HANDLE, gpu_desc_handle: d3d12.GPU_DESCRIPTOR_HANDLE) {
+                // LEAK: we are doing nothing here! make this offset available again for overwriting.
+            }
+        }
+
+        ok := imgui_impl_dx12.Init(&dx12_info)
+        if !ok {
+            fmt.println("Failed to initialise imgui DX12")
+        }
+
+        // Initialise SDL3
+        ok = imgui_impl_sdl3.InitForD3D(window)
+        if !ok {
+            fmt.println("Failed to initialise imgui SDL3")
+        }
+
+    }
+
     rot : f32 = 0.0
+    descriptor_heaps : []^d3d12.IDescriptorHeap = { srv_heap }
 
     running := true
     for (running == true) {
@@ -718,6 +774,9 @@ main :: proc() {
         {
             event : sdl3.Event
             for (sdl3.PollEvent(&event) == true) {
+
+                // ImGui Events
+                imgui_impl_sdl3.ProcessEvent(&event)
 
                 // window 'X' button
                 if (event.type == sdl3.EventType.QUIT) {
@@ -755,6 +814,11 @@ main :: proc() {
         hr = command_list->Reset(command_allocator, pipeline)
         check(hr, "Failed to reset command list")
 
+        // ImGui
+        imgui_impl_dx12.NewFrame()
+        imgui_impl_sdl3.NewFrame()
+        imgui.NewFrame()
+        imgui.ShowDemoWindow()
 
         // transformation
         {
@@ -807,6 +871,7 @@ main :: proc() {
         // bind root parameter (the shader function arguments)
         command_list->SetGraphicsRootConstantBufferView(0, constant_buffer->GetGPUVirtualAddress())
 
+        command_list->SetDescriptorHeaps(1, &descriptor_heaps[0])
 
         command_list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle)
 
@@ -821,14 +886,20 @@ main :: proc() {
         command_list->IASetVertexBuffers(0, 1, &vertex_buffer_view)
         command_list->DrawIndexedInstanced(u32(len(indices)), 1, 0, 0, 0)
 
+        // ImGui End Frame
+        imgui.Render()
+        imgui_impl_dx12.RenderDrawData(imgui.GetDrawData(), command_list)
+
         to_present_barrier := to_render_target_barrier
         to_present_barrier.Transition.StateBefore = {.RENDER_TARGET}
         to_present_barrier.Transition.StateAfter = d3d12.RESOURCE_STATE_PRESENT
 
         command_list->ResourceBarrier(1, &to_present_barrier)
 
+
         hr = command_list->Close()
         check(hr, "Failed to close command list")
+
 
         // excute command list(s)
         command_lists := [?]^d3d12.IGraphicsCommandList {command_list}
@@ -863,5 +934,11 @@ main :: proc() {
         }
 
     }
+
+    // TODO: Cleanup D3D resources
+    imgui_impl_dx12.Shutdown()
+    imgui_impl_sdl3.Shutdown()
+    imgui.DestroyContext()
+
 
 }
