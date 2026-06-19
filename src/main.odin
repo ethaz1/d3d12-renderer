@@ -1,14 +1,13 @@
-// allow using
-#+feature using-stmt 
-
 package main
+
 
 import win32 "core:sys/windows"
 import "core:os"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
-
+import "core:strconv"
+import "core:path/filepath"
 import "vendor:sdl3"
 import "vendor:directx/d3d12"
 import "vendor:directx/dxgi"
@@ -19,8 +18,9 @@ import "core:math/linalg"
 NUM_RENDERTARGETS :: 2
 SHADER_FILENAME :: "shaders/main.hlsl"
 NUM_DESCRIPTORS :: 128
-WINDOW_WIDTH :: 800
-WINDOW_HEIGHT :: 600
+WINDOW_WIDTH :: 1280
+WINDOW_HEIGHT :: 720
+MODEL_NAME :: "models/suzanne.obj"
 
 Vertex :: struct {
     position : linalg.Vector3f32,
@@ -29,9 +29,9 @@ Vertex :: struct {
 
 // constant buffer (or uniform in OpenGL)
 FrameConstants :: struct {
-    world: linalg.Matrix4x4f32,
-    view: linalg.Matrix4x4f32,
-    proj: linalg.Matrix4x4f32
+    world: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32
 }
 
 // checks the result of an HRESULT
@@ -53,6 +53,11 @@ mat4_identity :: proc() -> linalg.Matrix4x4f32 {
 }
 
 main :: proc() {
+
+    // Make relative paths start from the .exe location, in case we get launched from elsewhere
+    if len(os.args) > 0 {
+        os.set_current_directory(filepath.dir(os.args[0]))
+    }
 
     wx := i32(WINDOW_WIDTH)
     wy := i32(WINDOW_HEIGHT)
@@ -94,10 +99,10 @@ main :: proc() {
         check(hr, "Failed to create DXGI factory.")
     }
 
+    // D3D debugging
     debug_controller : ^d3d12.IDebug1
     dxgi_debug : ^dxgi.IDebug1
     hr : dxgi.HRESULT
-
     when ODIN_DEBUG {
         // D3D12 debug layer
         hr = d3d12.GetDebugInterface(d3d12.IDebug1_UUID, (^rawptr)(&debug_controller))
@@ -186,6 +191,64 @@ main :: proc() {
         check(hr, "Failed creating RTV descriptor heap")
     }
 
+
+    // depth-stencil view (can store both a depth buffer AND a stencil buffer)
+    dsv_descriptor_heap : ^d3d12.IDescriptorHeap
+    dsv_handle: d3d12.CPU_DESCRIPTOR_HANDLE
+    depth_stencil_buffer : ^d3d12.IResource
+    {
+        desc := d3d12.DESCRIPTOR_HEAP_DESC {
+            NumDescriptors = 1,
+            Type = .DSV,
+            Flags = {}
+        }
+
+        dsv_desc := d3d12.DEPTH_STENCIL_VIEW_DESC {
+            Format = .D32_FLOAT,
+            ViewDimension = .TEXTURE2D,
+            Texture2D = {MipSlice=0},
+            Flags = {},
+        }
+
+        ds_clear_value := d3d12.CLEAR_VALUE {
+            Format = .D32_FLOAT,
+            DepthStencil = { Depth=1.0, Stencil=0 }
+        }
+        
+        heap_props := d3d12.HEAP_PROPERTIES {
+            Type = .DEFAULT,
+        }
+
+        depth_desc := d3d12.RESOURCE_DESC {
+            Dimension        = .TEXTURE2D,
+            Width            = u64(wx),
+            Height           = u32(wy),
+            DepthOrArraySize = 1,
+            MipLevels        = 1,
+
+            Format = .D32_FLOAT,
+
+            SampleDesc = {
+                Count = 1,
+                Quality = 0
+            },
+
+            Layout = .UNKNOWN,
+
+            Flags = {.ALLOW_DEPTH_STENCIL},
+        }
+
+        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&dsv_descriptor_heap))
+        check(hr, "Failed to create DSV descriptor heap")
+
+        hr = device->CreateCommittedResource(&heap_props, {}, &depth_desc, {.DEPTH_WRITE}, &ds_clear_value, d3d12.IResource_UUID, (^rawptr)(&depth_stencil_buffer))
+        check(hr, "Failed to create depth buffer")
+
+        dsv_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&dsv_handle)
+
+        device->CreateDepthStencilView(depth_stencil_buffer, &dsv_desc, dsv_handle)
+    }
+
     // constant buffer/shader resource/unordered access view
     cb_descriptor_heap : ^d3d12.IDescriptorHeap
     {
@@ -259,25 +322,26 @@ main :: proc() {
 
     }
 
-    // The pipeline contains the shaders etc to use
+    // the pipeline contains the shaders etc to use
     pipeline: ^d3d12.IPipelineState
-
     {
-        // Compile vertex and pixel shaders
+
+        // load the shader rom disk
         data, ok := os.read_entire_file(SHADER_FILENAME)
         if !ok {
             fmt.println("failed to load shader file:", SHADER_FILENAME)
             os.exit(-1)
         }
-
         data_size: uint = len(data)
 
+        // debugging flags for the shader compiler
         compile_flags: u32 = 0
         when ODIN_DEBUG {
             compile_flags |= u32(d3d_compiler.D3DCOMPILE.DEBUG)
             compile_flags |= u32(d3d_compiler.D3DCOMPILE.SKIP_OPTIMIZATION)
         }
 
+        // try compile vertex and pixel shaders
         vs: ^d3d12.IBlob = nil
         ps: ^d3d12.IBlob = nil
         {
@@ -364,8 +428,14 @@ main :: proc() {
                 ConservativeRaster = .OFF,
             },
             DepthStencilState = {
-                DepthEnable = false,
+                DepthEnable = true,
+                DepthWriteMask = .ALL,
+                DepthFunc = .LESS,
                 StencilEnable = false,
+                StencilReadMask = d3d12.DEFAULT_STENCIL_READ_MASK,
+                StencilWriteMask = d3d12.DEFAULT_STENCIL_WRITE_MASK,
+                FrontFace = {d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.COMPARISON_FUNC.ALWAYS},
+                BackFace = {d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.STENCIL_OP.KEEP, d3d12.COMPARISON_FUNC.ALWAYS}
             },
             InputLayout = {
                 pInputElementDescs = &vertex_format[0],
@@ -374,7 +444,7 @@ main :: proc() {
             PrimitiveTopologyType = .TRIANGLE,
             NumRenderTargets = 1,
             RTVFormats = { 0 = .R8G8B8A8_UNORM, 1..<7 = .UNKNOWN },
-            DSVFormat = .UNKNOWN,
+            DSVFormat = .D32_FLOAT,
             SampleDesc = {
                 Count = 1,
                 Quality = 0,
@@ -390,67 +460,204 @@ main :: proc() {
 
     // command list
     command_list : ^d3d12.IGraphicsCommandList
-    hr = device->CreateCommandList(0, .DIRECT, command_allocator, pipeline, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
-    check(hr, "Failed to create command list.")
+    {
+        hr = device->CreateCommandList(0, .DIRECT, command_allocator, pipeline, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
+        check(hr, "Failed to create command list.")
 
-    hr = command_list->Close()
-    check(hr, "Failed to close command list.")
+        hr = command_list->Close()
+        check(hr, "Failed to close command list.")
+    }
 
-    // vertex buffer
+
+
+    // model loading
+    indices : [dynamic]u32
+    vertices : [dynamic]Vertex
+    {
+        VertexKey :: struct {
+            v : int,
+            vt : int,
+            vn : int
+        }
+
+        positions : [dynamic]linalg.Vector3f32  // list of all unique positions in the OBJ
+        normals : [dynamic]linalg.Vector3f32    // list of all unique normals in the OBJ
+        vertex_map : map[VertexKey]u32          // hash-map of verticies and their corresponding indices, if they exist.
+
+        defer delete(positions)
+        defer delete(normals)
+        defer delete(vertex_map)
+
+        // load our OBJ file
+        obj, ok := os.read_entire_file(MODEL_NAME)
+        if !ok {
+            fmt.println("Failed to load model:", MODEL_NAME, ". Not found.")
+            os.exit(-1)
+        }
+        defer delete(obj, context.allocator)
+
+
+        // parse the OBJ
+        it := string(obj)
+        for line in strings.split_lines_iterator(&it) {
+            if strings.starts_with(line, "v ") {            // positions
+                v := strings.fields(line)
+                if len(v) < 4 { continue }
+                x, _ := strconv.parse_f32(v[1])
+                y, _ := strconv.parse_f32(v[2])
+                z, _ := strconv.parse_f32(v[3])
+                append(&positions, linalg.Vector3f32{x, y, z})
+            }
+            else if strings.starts_with(line, "vn") {       // normals
+                vn := strings.fields(line)
+                if len(vn) < 4 { continue }
+                x, _ := strconv.parse_f32(vn[1])
+                y, _ := strconv.parse_f32(vn[2])
+                z, _ := strconv.parse_f32(vn[3])
+                append(&normals, linalg.Vector3f32{x, y, z})
+            }
+            else if strings.starts_with(line, "f") {        // faces (indices)
+                // format as follows (e.g f v/vt/vn v/vt/vn v/vt/vn)
+                face := strings.fields(line)
+                if len(face) < 4 { continue }
+
+                for i := 0; i < 3; i += 1 {     // for each vertex of this face
+                    // pull out the indices
+                    indices_str := strings.fields_proc(face[i+1], proc(r: rune) -> bool {return r == '/'})
+
+                    v_idx, _ := strconv.parse_int(indices_str[0])
+                    vt_idx, _ := strconv.parse_int(indices_str[1])
+                    vn_idx, _ := strconv.parse_int(indices_str[2])
+
+                    // OBJ indices are 1-based
+                    v_idx -= 1
+                    vt_idx -= 1
+                    vn_idx -= 1
+
+                    // get the index of this vertex.
+                    key := VertexKey{v_idx, vt_idx, vn_idx}
+                    existing_vertex_index, exists := vertex_map[key]
+
+                    if exists {
+                        // reuse existing vertex
+                        append(&indices, existing_vertex_index)
+                    } else {
+                        // create new vertex
+                        pos := positions[v_idx]
+                        norm := normals[vn_idx]
+
+                        next_index := u32(len(vertices))
+                        append(&vertices, Vertex{pos, {norm.x, norm.y, norm.z, 1.0}})
+
+                        vertex_map[key] = next_index
+                        append(&indices, next_index)
+
+                    }
+                }
+            }
+        }
+    }
+
+    // vertex buffer (loading "vertices")
     vertex_buffer : ^d3d12.IResource
     vertex_buffer_view : d3d12.VERTEX_BUFFER_VIEW
+    {
+        size := len(vertices) * size_of(Vertex)
+        gpu_data : rawptr
+        read_range : d3d12.RANGE
+
+        heap_props := d3d12.HEAP_PROPERTIES {
+            Type = .UPLOAD,
+        }
+
+        resource_desc := d3d12.RESOURCE_DESC {
+            Dimension = .BUFFER,
+            Alignment = 0,
+            Width = u64(size),
+            Height = 1,
+            DepthOrArraySize = 1,
+            MipLevels = 1,
+            Format = .UNKNOWN,
+            SampleDesc = { Count = 1, Quality = 0 },
+            Layout = .ROW_MAJOR,
+            Flags = {},
+        }
+
+
+        hr = device->CreateCommittedResource(&heap_props, {}, &resource_desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&vertex_buffer))
+        check(hr, "Failed creating vertex buffer")
+
+
+        // map GPU data into system RAM so the CPU can write to it
+        hr = vertex_buffer->Map(0, &read_range, &gpu_data)
+        check(hr, "Failed creating vertex buffer resource")
+        mem.copy(gpu_data, &vertices[0], size)
+        vertex_buffer->Unmap(0, nil)
+
+
+        // vertex buffer view
+        vertex_buffer_view = d3d12.VERTEX_BUFFER_VIEW {
+            BufferLocation = vertex_buffer->GetGPUVirtualAddress(),
+            StrideInBytes = u32(size_of(Vertex)),
+            SizeInBytes = u32(size)
+        }
+    }
+
+
+
+    // create index buffer
+    index_buffer : ^d3d12.IResource
+    index_buffer_view : d3d12.INDEX_BUFFER_VIEW
+    {
+        size := len(indices) * size_of(u32)
+        gpu_data : rawptr
+        read_range : d3d12.RANGE
+
+        desc := d3d12.RESOURCE_DESC {
+            Dimension = .BUFFER,
+            Alignment = 0,
+            Width = u64(size),
+            Height = 1,
+            DepthOrArraySize = 1,
+            MipLevels = 1,
+            Format = .UNKNOWN,
+            SampleDesc = {Count = 1, Quality = 0},
+            Layout = .ROW_MAJOR,
+            Flags = {}
+        }
+
+        heap_props := d3d12.HEAP_PROPERTIES {
+            Type = .UPLOAD
+        }
+
+        hr = device->CreateCommittedResource(&heap_props, {}, &desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&index_buffer))
+        check(hr, "Failed creating index buffer")
+
+
+        // map GPU data into system RAM so the CPU can write to it
+        hr = index_buffer->Map(0, &read_range, &gpu_data)
+        check(hr, "Failed mapping GPU data")
+        mem.copy(gpu_data, &indices[0], size)
+        index_buffer->Unmap(0, nil)
+
+        index_buffer_view = d3d12.INDEX_BUFFER_VIEW{
+            BufferLocation = index_buffer->GetGPUVirtualAddress(),
+            SizeInBytes = u32(size),
+            Format = .R32_UINT
+        }
+
+    }
+
     
-    vertices := [?]Vertex {
-        Vertex{ linalg.Vector3f32{0.0, 0.5, 0.0}, linalg.Vector4f32{1.0, 0.0, 0.0, 0.0} },
-        Vertex{ linalg.Vector3f32{0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 1.0, 0.0, 0.0} },
-        Vertex{ linalg.Vector3f32{-0.5, -0.5, 0.0}, linalg.Vector4f32{0.0, 0.0, 1.0, 0.0} },
-    }
-
-    heap_props := d3d12.HEAP_PROPERTIES {
-        Type = .UPLOAD,
-    }
-
-    vertex_buffer_size := len(vertices) * size_of(Vertex)
-
-    resource_desc := d3d12.RESOURCE_DESC {
-        Dimension = .BUFFER,
-        Alignment = 0,
-        Width = u64(vertex_buffer_size),
-        Height = 1,
-        DepthOrArraySize = 1,
-        MipLevels = 1,
-        Format = .UNKNOWN,
-        SampleDesc = { Count = 1, Quality = 0 },
-        Layout = .ROW_MAJOR,
-        Flags = {},
-    }
-
-    hr = device->CreateCommittedResource(&heap_props, {}, &resource_desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&vertex_buffer))
-    check(hr, "Failed creating vertex buffer")
-
-    gpu_data : rawptr
-    read_range : d3d12.RANGE
-
-    // map GPU data into system RAM so the CPU can write to it
-    hr = vertex_buffer->Map(0, &read_range, &gpu_data)
-    check(hr, "Failed creating vertex buffer resource")
-
-    mem.copy(gpu_data, &vertices[0], vertex_buffer_size)
-
-    vertex_buffer->Unmap(0, nil)
-
-    vertex_buffer_view = d3d12.VERTEX_BUFFER_VIEW {
-        BufferLocation = vertex_buffer->GetGPUVirtualAddress(),
-        StrideInBytes = u32(vertex_buffer_size/3),
-        SizeInBytes = u32(vertex_buffer_size)
-    }
-
-    
-    // constant buffers
+    // constant buffer
     constant_buffer : ^d3d12.IResource
     frame_constants : ^FrameConstants
     {
-        const_buff_desc := d3d12.RESOURCE_DESC {
+        gpu_data : rawptr
+        read_range : d3d12.RANGE
+        cbv_handle : d3d12.CPU_DESCRIPTOR_HANDLE
+
+        cb_desc := d3d12.RESOURCE_DESC {
             Dimension = .BUFFER,
             Alignment = 0,
             Width = 256,    // TODO: round up properly
@@ -463,32 +670,26 @@ main :: proc() {
             Flags = {}
         }
 
-        // each resource needs its own heap property
-        // this one is for the constant buffer
-        heap_props2 := d3d12.HEAP_PROPERTIES {
+        heap_props := d3d12.HEAP_PROPERTIES {
             Type = .UPLOAD
         }
 
-        hr = device->CreateCommittedResource(&heap_props2, {}, &const_buff_desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&constant_buffer))
+        hr = device->CreateCommittedResource(&heap_props, {}, &cb_desc, d3d12.RESOURCE_STATE_GENERIC_READ, nil, d3d12.IResource_UUID, (^rawptr)(&constant_buffer))
         check(hr, "Failed to create constant buffers")
 
-        gpu_data : rawptr
-        read_range : d3d12.RANGE
-
+        // keep the constant buffer mapped so we can write to it every frame.
         constant_buffer->Map(0, nil, (^rawptr)(&frame_constants))
+
+
+        // create constant buffer view
+        cbv_desc := d3d12.CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation = constant_buffer->GetGPUVirtualAddress(),
+            SizeInBytes = 256,      // TODO: round up to 256 properly
+        }
+
+        cb_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&cbv_handle)
+        device->CreateConstantBufferView(&cbv_desc, cbv_handle)
     }
-
-    const_buff_view_desc := d3d12.CONSTANT_BUFFER_VIEW_DESC {
-        BufferLocation = constant_buffer->GetGPUVirtualAddress(),
-        SizeInBytes = 256,      // TODO: round up to 256 properly
-
-    }
-
-    const_buff_view_desc_handle : d3d12.CPU_DESCRIPTOR_HANDLE
-    cb_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&const_buff_view_desc_handle)
-    device->CreateConstantBufferView(&const_buff_view_desc, const_buff_view_desc_handle)
-    
-    
 
     // This fence is used to wait for frames to finish
     fence_value: u64
@@ -508,14 +709,7 @@ main :: proc() {
     }
 
 
-
     rot : f32 = 0.0
-    frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, -2.0})
-    fov_y  : f32 = 60.0 * 3.14159 / 180.0
-    aspect := f32(wx) / f32(wy)
-    near   : f32 = 0.1
-    far    : f32 = 1000.0
-    frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far)
 
     running := true
     for (running == true) {
@@ -546,6 +740,8 @@ main :: proc() {
         viewport := d3d12.VIEWPORT {
             Width = f32(wx),
             Height = f32(wy),
+            MinDepth = -1.0,
+            MaxDepth = 1.0
         }
 
         scissor_rect := d3d12.RECT {
@@ -560,15 +756,24 @@ main :: proc() {
         check(hr, "Failed to reset command list")
 
 
-
         // transformation
         {
-            // rotate around our object
+            rot += 0.01
 
-            using linalg
-
+            // Object transform
             frame_constants.world = mat4_identity()
-            frame_constants.view = mul(frame_constants.view, matrix4_rotate_f32(cast(f32)to_radians(0.1), {0.0, 1.0, 0.0}))
+
+            // Camera transform
+            frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, 5.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * (rot*50), {0.0, 0.5, 0.0})
+
+
+            // Projection
+            fov_y : f32 = 45.0 * 3.14159 / 180.0
+            aspect := f32(wx) / f32(wy)
+            near   : f32 = 0.1
+            far    : f32 = 1000.0
+            frame_constants.proj = linalg.matrix4_perspective_f32(fov_y, aspect, near, far, false)
         }
 
     
@@ -597,19 +802,24 @@ main :: proc() {
             rtv_handle.ptr += uint(frame_index * s)
         }
 
+
+        
         // bind root parameter (the shader function arguments)
         command_list->SetGraphicsRootConstantBufferView(0, constant_buffer->GetGPUVirtualAddress())
 
-        command_list->OMSetRenderTargets(1, &rtv_handle, false, nil)
 
-        // clear backbuffer
+        command_list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle)
+
+        // clear backbuffer & depth/stencil 
         clear_colour := [?]f32 { 0.05, 0.05, 0.05, 1.0 }
         command_list->ClearRenderTargetView(rtv_handle, &clear_colour, 0, nil)
+        command_list->ClearDepthStencilView(dsv_handle, {.DEPTH}, 1.0, 0, 0, nil)
 
         // draw call
         command_list->IASetPrimitiveTopology(.TRIANGLELIST)
+        command_list->IASetIndexBuffer(&index_buffer_view)
         command_list->IASetVertexBuffers(0, 1, &vertex_buffer_view)
-        command_list->DrawInstanced(3, 1, 0, 0)
+        command_list->DrawIndexedInstanced(u32(len(indices)), 1, 0, 0, 0)
 
         to_present_barrier := to_render_target_barrier
         to_present_barrier.Transition.StateBefore = {.RENDER_TARGET}
