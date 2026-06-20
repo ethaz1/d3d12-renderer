@@ -13,6 +13,7 @@ import "vendor:directx/d3d12"
 import "vendor:directx/dxgi"
 import "vendor:directx/d3d_compiler"
 import "core:math/linalg"
+import "core:math"
 
 import "vendor_local/imgui"
 import "vendor_local/imgui/imgui_impl_dx12"
@@ -54,6 +55,24 @@ vec4 :: proc(v: linalg.Vector3f32, w: f32) -> linalg.Vector4f32 {
 
 mat4_identity :: proc() -> linalg.Matrix4x4f32 {
     return linalg.identity_matrix(linalg.Matrix4x4f32)
+}
+
+
+MouseState :: struct {
+    left_down : bool,
+    right_down : bool,
+    x : f32,
+    y : f32,
+    x_norm : f32,  // mouse X between [-1, 1]
+    y_norm : f32,  // mouse Y between [-1, 1]
+    x_delta : f32,
+    y_delta : f32,
+    x_delta_norm : f32,
+    y_delta_norm : f32
+}
+
+InputState :: struct {
+    mouse : MouseState
 }
 
 srv_heap_next_available_index : u32 = 0
@@ -767,6 +786,23 @@ main :: proc() {
     rot : f32 = 0.0
     descriptor_heaps : []^d3d12.IDescriptorHeap = { srv_heap }
 
+    cam_rotation : [3]f32 = {0.0, 180, 0.0}
+    mouse_sensitivity : f32 = 2.0
+
+    // Input Handling
+    input := InputState {
+        mouse = {
+            left_down = false,
+            right_down = false,
+            x = 0.0,
+            y = 0.0,
+            x_norm = 0.0,
+            y_norm = 0.0,
+            x_delta = 0.0,
+            y_delta = 0.0
+        }
+    }
+
     running := true
     for (running == true) {
 
@@ -792,8 +828,39 @@ main :: proc() {
                     }
                 }
 
+                // Mouse
+                if (event.type == sdl3.EventType.MOUSE_BUTTON_DOWN) {
+                    type := event.button.button
+                    if (type == sdl3.BUTTON_LEFT) { input.mouse.left_down = true }
+                    if (type == sdl3.BUTTON_RIGHT) { input.mouse.right_down = true }
+                }
+
+                if (event.type == sdl3.EventType.MOUSE_BUTTON_UP) {
+                    type := event.button.button
+                    if (type == sdl3.BUTTON_LEFT) { input.mouse.left_down = false }
+                    if (type == sdl3.BUTTON_RIGHT) { input.mouse.right_down = false }
+                }
+
+                if (event.type == sdl3.EventType.MOUSE_MOTION) {
+                    input.mouse.x = event.button.x
+                    input.mouse.y = event.button.y
+                    input.mouse.x_norm = ( (input.mouse.x / (f32)(wx)) * 2 ) - 1
+                    input.mouse.y_norm = ( (input.mouse.y / (f32)(wy)) * -2 ) + 1
+                    input.mouse.x_delta = event.motion.xrel
+                    input.mouse.y_delta = event.motion.yrel
+                }
+
             }
         }
+
+        {
+            a := sdl3.GetRelativeMouseState(&input.mouse.x_delta, &input.mouse.y_delta)
+            input.mouse.x_delta_norm = (input.mouse.x_delta / (f32)(wx))
+            input.mouse.y_delta_norm = (input.mouse.y_delta / (f32)(wy)) * -1
+        }
+
+        //fmt.println(input.mouse.x_delta_norm, input.mouse.y_delta_norm)
+
 
 
         viewport := d3d12.VIEWPORT {
@@ -822,14 +889,31 @@ main :: proc() {
 
         // transformation
         {
-            rot += 0.01
+            rot += 0.0001
 
-            // Object transform
             frame_constants.world = mat4_identity()
+            
 
             // Camera transform
+
+            imgui.Begin("Window")
+            imgui.DragFloat3("camera rotation", &cam_rotation)
+            imgui.End()
+
+            if input.mouse.right_down {
+                cam_rotation[1] += ( input.mouse.x_delta_norm * -180 ) * mouse_sensitivity
+                cam_rotation[0] += ( input.mouse.y_delta_norm * 180 ) * mouse_sensitivity
+            }
+
+            fmt.println(cam_rotation[1])
+
             frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, 5.0})
-            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * (rot*50), {0.0, 0.5, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[0], {1.0, 0.0, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[1], {0.0, 1.0, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[2], {0.0, 0.0, 1.0})
+
+
+            //frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * (rot*50), {0.0, 0.5, 0.0})
 
 
             // Projection
