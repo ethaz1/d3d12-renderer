@@ -13,13 +13,18 @@ import "vendor:directx/d3d12"
 import "vendor:directx/dxgi"
 import "vendor:directx/d3d_compiler"
 import "core:math/linalg"
+import "core:math"
+
+import "vendor_local/imgui"
+import "vendor_local/imgui/imgui_impl_dx12"
+import "vendor_local/imgui/imgui_impl_sdl3"
 
 
 NUM_RENDERTARGETS :: 2
 SHADER_FILENAME :: "shaders/main.hlsl"
 NUM_DESCRIPTORS :: 128
-WINDOW_WIDTH :: 1280
-WINDOW_HEIGHT :: 720
+WINDOW_WIDTH :: 1920
+WINDOW_HEIGHT :: 1080
 MODEL_NAME :: "models/suzanne.obj"
 
 Vertex :: struct {
@@ -51,6 +56,26 @@ vec4 :: proc(v: linalg.Vector3f32, w: f32) -> linalg.Vector4f32 {
 mat4_identity :: proc() -> linalg.Matrix4x4f32 {
     return linalg.identity_matrix(linalg.Matrix4x4f32)
 }
+
+
+MouseState :: struct {
+    left_down : bool,
+    right_down : bool,
+    x : f32,
+    y : f32,
+    x_norm : f32,  // mouse X between [-1, 1]
+    y_norm : f32,  // mouse Y between [-1, 1]
+    x_delta : f32,
+    y_delta : f32,
+    x_delta_norm : f32,
+    y_delta_norm : f32
+}
+
+InputState :: struct {
+    mouse : MouseState
+}
+
+srv_heap_next_available_index : u32 = 0
 
 main :: proc() {
 
@@ -250,7 +275,7 @@ main :: proc() {
     }
 
     // constant buffer/shader resource/unordered access view
-    cb_descriptor_heap : ^d3d12.IDescriptorHeap
+    srv_heap : ^d3d12.IDescriptorHeap
     {
         desc := d3d12.DESCRIPTOR_HEAP_DESC {
             NumDescriptors = NUM_DESCRIPTORS,   // hope thats enough
@@ -258,7 +283,7 @@ main :: proc() {
             Flags = {.SHADER_VISIBLE}           // data here gets seen by the shaders
         }
 
-        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&cb_descriptor_heap))
+        hr = device->CreateDescriptorHeap(&desc, d3d12.IDescriptorHeap_UUID, (^rawptr)(&srv_heap))
         check(hr, "Failed creating constant buffer descriptor heap")
     }
 
@@ -323,7 +348,7 @@ main :: proc() {
     }
 
     // the pipeline contains the shaders etc to use
-    pipeline: ^d3d12.IPipelineState
+    pso: ^d3d12.IPipelineState
     {
 
         // load the shader rom disk
@@ -451,7 +476,7 @@ main :: proc() {
             },
         }
         
-        hr = device->CreateGraphicsPipelineState(&pipeline_state_desc, d3d12.IPipelineState_UUID, (^rawptr)(&pipeline))
+        hr = device->CreateGraphicsPipelineState(&pipeline_state_desc, d3d12.IPipelineState_UUID, (^rawptr)(&pso))
         check(hr, "Pipeline creation failed")
 
         vs->Release()
@@ -461,7 +486,7 @@ main :: proc() {
     // command list
     command_list : ^d3d12.IGraphicsCommandList
     {
-        hr = device->CreateCommandList(0, .DIRECT, command_allocator, pipeline, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
+        hr = device->CreateCommandList(0, .DIRECT, command_allocator, pso, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
         check(hr, "Failed to create command list.")
 
         hr = command_list->Close()
@@ -687,8 +712,9 @@ main :: proc() {
             SizeInBytes = 256,      // TODO: round up to 256 properly
         }
 
-        cb_descriptor_heap->GetCPUDescriptorHandleForHeapStart(&cbv_handle)
+        srv_heap->GetCPUDescriptorHandleForHeapStart(&cbv_handle)
         device->CreateConstantBufferView(&cbv_desc, cbv_handle)
+        srv_heap_next_available_index += 1 // we need to keep track of our SRVs
     }
 
     // This fence is used to wait for frames to finish
@@ -709,7 +735,73 @@ main :: proc() {
     }
 
 
+    // ImGui
+    imgui.CHECKVERSION()
+    imgui.CreateContext()
+    {
+
+        // initialise D3D12 with ImGui
+        dx12_info := imgui_impl_dx12.InitInfo {
+            Device = device,
+            CommandQueue = queue,
+            NumFramesInFlight = 1, // ??? 
+            RTVFormat = .R8G8B8A8_UNORM,
+            DSVFormat = .D32_FLOAT,
+            UserData = nil,
+            SrvDescriptorHeap = srv_heap,
+            SrvDescriptorAllocFn = proc "cdecl" (info: ^imgui_impl_dx12.InitInfo, cpu_desc_handle: ^d3d12.CPU_DESCRIPTOR_HANDLE, gpu_desc_handle: ^d3d12.GPU_DESCRIPTOR_HANDLE) {
+                // get the next memory offset where we can put another SRV descriptor
+                cpu_base : d3d12.CPU_DESCRIPTOR_HANDLE
+                gpu_base : d3d12.GPU_DESCRIPTOR_HANDLE
+
+                info.SrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(&cpu_base)
+                info.SrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(&gpu_base)
+
+                descriptor_size := info.Device->GetDescriptorHandleIncrementSize(.CBV_SRV_UAV)
+                offset := srv_heap_next_available_index * descriptor_size
+
+                cpu_desc_handle.ptr = cpu_base.ptr + (uint)(offset)
+                gpu_desc_handle.ptr = gpu_base.ptr + (u64)(offset)
+
+                srv_heap_next_available_index += 1
+            },
+            SrvDescriptorFreeFn = proc "cdecl" (info: ^imgui_impl_dx12.InitInfo, cpu_desc_handle: d3d12.CPU_DESCRIPTOR_HANDLE, gpu_desc_handle: d3d12.GPU_DESCRIPTOR_HANDLE) {
+                // LEAK: we are doing nothing here! make this offset available again for overwriting.
+            }
+        }
+
+        ok := imgui_impl_dx12.Init(&dx12_info)
+        if !ok {
+            fmt.println("Failed to initialise imgui DX12")
+        }
+
+        // Initialise SDL3
+        ok = imgui_impl_sdl3.InitForD3D(window)
+        if !ok {
+            fmt.println("Failed to initialise imgui SDL3")
+        }
+
+    }
+
     rot : f32 = 0.0
+    descriptor_heaps : []^d3d12.IDescriptorHeap = { srv_heap }
+
+    cam_rotation : [3]f32 = {0.0, 180, 0.0}
+    mouse_sensitivity : f32 = 2.0
+
+    // Input Handling
+    input := InputState {
+        mouse = {
+            left_down = false,
+            right_down = false,
+            x = 0.0,
+            y = 0.0,
+            x_norm = 0.0,
+            y_norm = 0.0,
+            x_delta = 0.0,
+            y_delta = 0.0
+        }
+    }
 
     running := true
     for (running == true) {
@@ -718,6 +810,9 @@ main :: proc() {
         {
             event : sdl3.Event
             for (sdl3.PollEvent(&event) == true) {
+
+                // ImGui Events
+                imgui_impl_sdl3.ProcessEvent(&event)
 
                 // window 'X' button
                 if (event.type == sdl3.EventType.QUIT) {
@@ -733,8 +828,39 @@ main :: proc() {
                     }
                 }
 
+                // Mouse
+                if (event.type == sdl3.EventType.MOUSE_BUTTON_DOWN) {
+                    type := event.button.button
+                    if (type == sdl3.BUTTON_LEFT) { input.mouse.left_down = true }
+                    if (type == sdl3.BUTTON_RIGHT) { input.mouse.right_down = true }
+                }
+
+                if (event.type == sdl3.EventType.MOUSE_BUTTON_UP) {
+                    type := event.button.button
+                    if (type == sdl3.BUTTON_LEFT) { input.mouse.left_down = false }
+                    if (type == sdl3.BUTTON_RIGHT) { input.mouse.right_down = false }
+                }
+
+                if (event.type == sdl3.EventType.MOUSE_MOTION) {
+                    input.mouse.x = event.button.x
+                    input.mouse.y = event.button.y
+                    input.mouse.x_norm = ( (input.mouse.x / (f32)(wx)) * 2 ) - 1
+                    input.mouse.y_norm = ( (input.mouse.y / (f32)(wy)) * -2 ) + 1
+                    input.mouse.x_delta = event.motion.xrel
+                    input.mouse.y_delta = event.motion.yrel
+                }
+
             }
         }
+
+        {
+            a := sdl3.GetRelativeMouseState(&input.mouse.x_delta, &input.mouse.y_delta)
+            input.mouse.x_delta_norm = (input.mouse.x_delta / (f32)(wx))
+            input.mouse.y_delta_norm = (input.mouse.y_delta / (f32)(wy)) * -1
+        }
+
+        //fmt.println(input.mouse.x_delta_norm, input.mouse.y_delta_norm)
+
 
 
         viewport := d3d12.VIEWPORT {
@@ -752,20 +878,42 @@ main :: proc() {
         hr = command_allocator->Reset()
         check(hr, "Failed resetting command allocator")
 
-        hr = command_list->Reset(command_allocator, pipeline)
+        hr = command_list->Reset(command_allocator, pso)
         check(hr, "Failed to reset command list")
 
+        // ImGui
+        imgui_impl_dx12.NewFrame()
+        imgui_impl_sdl3.NewFrame()
+        imgui.NewFrame()
+        imgui.ShowDemoWindow()
 
         // transformation
         {
-            rot += 0.01
+            rot += 0.0001
 
-            // Object transform
             frame_constants.world = mat4_identity()
+            
 
             // Camera transform
+
+            imgui.Begin("Window")
+            imgui.DragFloat3("camera rotation", &cam_rotation)
+            imgui.End()
+
+            if input.mouse.right_down {
+                cam_rotation[1] += ( input.mouse.x_delta_norm * -180 ) * mouse_sensitivity
+                cam_rotation[0] += ( input.mouse.y_delta_norm * 180 ) * mouse_sensitivity
+            }
+
+            fmt.println(cam_rotation[1])
+
             frame_constants.view = linalg.matrix4_translate_f32({0.0, 0.0, 5.0})
-            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * (rot*50), {0.0, 0.5, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[0], {1.0, 0.0, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[1], {0.0, 1.0, 0.0})
+            frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * cam_rotation[2], {0.0, 0.0, 1.0})
+
+
+            //frame_constants.view *= linalg.matrix4_rotate_f32(linalg.RAD_PER_DEG * (rot*50), {0.0, 0.5, 0.0})
 
 
             // Projection
@@ -807,6 +955,7 @@ main :: proc() {
         // bind root parameter (the shader function arguments)
         command_list->SetGraphicsRootConstantBufferView(0, constant_buffer->GetGPUVirtualAddress())
 
+        command_list->SetDescriptorHeaps(1, &descriptor_heaps[0])
 
         command_list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle)
 
@@ -821,14 +970,20 @@ main :: proc() {
         command_list->IASetVertexBuffers(0, 1, &vertex_buffer_view)
         command_list->DrawIndexedInstanced(u32(len(indices)), 1, 0, 0, 0)
 
+        // ImGui End Frame
+        imgui.Render()
+        imgui_impl_dx12.RenderDrawData(imgui.GetDrawData(), command_list)
+
         to_present_barrier := to_render_target_barrier
         to_present_barrier.Transition.StateBefore = {.RENDER_TARGET}
         to_present_barrier.Transition.StateAfter = d3d12.RESOURCE_STATE_PRESENT
 
         command_list->ResourceBarrier(1, &to_present_barrier)
 
+
         hr = command_list->Close()
         check(hr, "Failed to close command list")
+
 
         // excute command list(s)
         command_lists := [?]^d3d12.IGraphicsCommandList {command_list}
@@ -863,5 +1018,11 @@ main :: proc() {
         }
 
     }
+
+    // TODO: Cleanup D3D resources
+    imgui_impl_dx12.Shutdown()
+    imgui_impl_sdl3.Shutdown()
+    imgui.DestroyContext()
+
 
 }
