@@ -348,7 +348,7 @@ main :: proc() {
     }
 
     // the pipeline contains the shaders etc to use
-    pipeline: ^d3d12.IPipelineState
+    pso: ^d3d12.IPipelineState
     {
 
         // load the shader rom disk
@@ -476,7 +476,7 @@ main :: proc() {
             },
         }
         
-        hr = device->CreateGraphicsPipelineState(&pipeline_state_desc, d3d12.IPipelineState_UUID, (^rawptr)(&pipeline))
+        hr = device->CreateGraphicsPipelineState(&pipeline_state_desc, d3d12.IPipelineState_UUID, (^rawptr)(&pso))
         check(hr, "Pipeline creation failed")
 
         vs->Release()
@@ -486,7 +486,7 @@ main :: proc() {
     // command list
     command_list : ^d3d12.IGraphicsCommandList
     {
-        hr = device->CreateCommandList(0, .DIRECT, command_allocator, pipeline, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
+        hr = device->CreateCommandList(0, .DIRECT, command_allocator, pso, d3d12.ICommandList_UUID, (^rawptr)(&command_list))
         check(hr, "Failed to create command list.")
 
         hr = command_list->Close()
@@ -878,7 +878,7 @@ main :: proc() {
         hr = command_allocator->Reset()
         check(hr, "Failed resetting command allocator")
 
-        hr = command_list->Reset(command_allocator, pipeline)
+        hr = command_list->Reset(command_allocator, pso)
         check(hr, "Failed to reset command list")
 
         // ImGui
